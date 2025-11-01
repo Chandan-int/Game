@@ -19,6 +19,31 @@ class GameAPIHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self._set_headers()
 
+    def do_GET(self):
+        """Handle simple GET requests for health checks and root info.
+
+        Return JSON for '/' and '/api/health', 204 for '/favicon.ico' and
+        known .well-known probes, and 404 for other GETs. This prevents the
+        default 501 responses when a browser or tool probes the server.
+        """
+        path = self.path
+
+        # respond to health check and root
+        if path == '/' or path == '/api/health':
+            self._set_headers(200)
+            payload = {'status': 'ok', 'path': path}
+            self.wfile.write(json.dumps(payload).encode('utf-8'))
+            return
+
+        # browsers/tools often request favicon or well-known probes; return no content
+        if path == '/favicon.ico' or path.startswith('/.well-known'):
+            self._set_headers(204)
+            return
+
+        # fallback: not found
+        self._set_headers(404)
+        self.wfile.write(json.dumps({'error': 'Not found'}).encode('utf-8'))
+
     def do_POST(self):
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
@@ -216,7 +241,31 @@ def run_server(port=8001):
     server_address = ('', port)
     httpd = HTTPServer(server_address, GameAPIHandler)
     print(f'Starting game server on port {port}...')
-    httpd.serve_forever()
+    # Use a request-handling loop that recovers from malformed connections
+    # (for example when an HTTPS/TLS client connects to an HTTP server).
+    # HTTPServer.handle_request() handles a single request and returns, so
+    # we can catch and log exceptions per-request and keep the server running.
+    httpd.timeout = 1  # allow periodic wake-ups to check for shutdown
+    try:
+        while True:
+            try:
+                httpd.handle_request()
+            except ConnectionResetError:
+                # client closed the connection abruptly; log and continue
+                print('Warning: connection reset by peer')
+                continue
+            except Exception as e:
+                # Detect common TLS ClientHello prefix to give a clearer hint
+                # to the developer when HTTPS is sent to an HTTP server.
+                msg = str(e)
+                if 'Bad request version' in msg or msg.startswith("'\\x16\\x03"):
+                    print('Warning: received non-HTTP data (possible HTTPS/TLS handshake) on HTTP port')
+                print('Warning: error while handling request:', e)
+                continue
+    except KeyboardInterrupt:
+        print('\nShutting down server (keyboard interrupt)')
+    finally:
+        httpd.server_close()
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8001
